@@ -78,6 +78,9 @@ def main() -> None:
                     help='输出设备名匹配串（默认 "CABLE Input"，即 VB-CABLE 输入）')
     ap.add_argument('--rate', type=int, default=48000, help='采样率（默认 48000）')
     ap.add_argument('--channels', type=int, default=1, help='声道数（默认 1）')
+    ap.add_argument('--save', default=None,
+                    help='同时把收到的 PCM 原样存入文件（如 test.raw；'
+                         '48kHz/单声道/16bit 小端，可用 ffmpeg 分析）')
     ap.add_argument('--list-devices', action='store_true', help='列出音频设备后退出')
     args = ap.parse_args()
 
@@ -111,6 +114,14 @@ def main() -> None:
 
     state = {'total': 0, 'level': 0.0, 'lock': threading.Lock()}
     stop_flag = threading.Event()
+
+    save_fp = None
+    if args.save:
+        try:
+            save_fp = open(args.save, 'wb')
+            print('[+] 同时保存原始 PCM 到: %s' % args.save)
+        except OSError as e:
+            print('[!] 无法创建保存文件 %s: %s' % (args.save, e))
 
     def meter() -> None:
         last = 0
@@ -148,6 +159,11 @@ def main() -> None:
                     with state['lock']:
                         state['total'] += len(data)
                     state['level'] = rms_level(data)
+                    if save_fp is not None:
+                        try:
+                            save_fp.write(data)
+                        except OSError as e:
+                            sys.stdout.write('\n[!] 写入保存文件失败: %s\n' % e)
                     buf += data
                     # 按固定块写入声卡，避免块大小不齐
                     while len(buf) >= WRITE_CHUNK_BYTES:
@@ -162,6 +178,11 @@ def main() -> None:
         sys.stdout.write('\n[+] 正在退出…\n')
     finally:
         stop_flag.set()
+        if save_fp is not None:
+            try:
+                save_fp.close()
+            except OSError:
+                pass
         try:
             stream.stop()
             stream.close()
