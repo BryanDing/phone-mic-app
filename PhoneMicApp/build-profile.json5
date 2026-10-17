@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\Administrator\\.ohos\\config\\default_PhoneMicApp_9EUzFqwUOEBTMacBlAi60hMb_6Z3bp_Idz7KDB79cC4=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B8F8122C928C3C0DC44D6C94BB59A0BD89F30BD9AA9ED16C4C8ED74E3934DD3AB0CF375B47BCB0B",
+          "profile": "C:\\Users\\Administrator\\.ohos\\config\\default_PhoneMicApp_9EUzFqwUOEBTMacBlAi60hMb_6Z3bp_Idz7KDB79cC4=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\Administrator\\.ohos\\config\\default_PhoneMicApp_9EUzFqwUOEBTMacBlAi60hMb_6Z3bp_Idz7KDB79cC4=.p12",
+          "storePassword": "0000001B76C5AFA6E429163F994190AFC7FC290B79307B7DB5A41DFCC7A64D25BFB7C9659709B20FBE6248"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

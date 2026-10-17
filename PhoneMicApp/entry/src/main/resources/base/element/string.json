@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "手机麦克风推流"
+    },
+    {
+      "name": "module_desc",
+      "value": "把手机麦克风音频实时发送到电脑"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "手机麦克风推流"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "手机麦克风推流到电脑"
+    },
+    {
+      "name": "reason_internet",
+      "value": "需要网络权限，把音频发送到电脑"
+    },
+    {
+      "name": "reason_mic",
+      "value": "需要麦克风权限，采集声音并发送到电脑"
+    }
+  ]
+}

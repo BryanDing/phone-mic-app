@@ -1,0 +1,34 @@
+# ===== 操作系统 =====
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ===== Python (pc-receiver) =====
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ===== HarmonyOS / DevEco (PhoneMicApp) =====
+node_modules/
+oh_modules/
+local.properties
+**/build/
+.hvigor/
+.idea/
+.cxx/
+.clangd/
+.clang-format/
+.clang-tidy/
+**/.test/
+.appanalyzer/
+*.hap
+*.hap.*
+*.app
+*.app.*
+
+# ===== 日志与临时文件 =====
+*.log
+*.tmp
