@@ -76,24 +76,27 @@ static napi_value NrPull(napi_env env, napi_callback_info info)
         got = pl.Pull(tmp.data(), tmp.size());
     }
     napi_value ab = nullptr;
-    napi_status st = napi_create_arraybuffer(env, got, nullptr, &ab);
+    // 鸿蒙 NAPI 坑（官方差异文档实锤）：napi_create_arraybuffer 的 data 参数
+    // 不能直接传 nullptr——即便长度 >0 也会返回 napi_generic_failure，
+    // 必须传"指向空指针的指针"让 NAPI 自行分配。这也是最初闪退的深层原因：
+    // 创建失败时返回了未初始化句柄。
+    void* data = nullptr;
+    napi_status st = napi_create_arraybuffer(env, got, &data, &ab);
     if (st != napi_ok || ab == nullptr) {
-        // 兜底：创建失败时也必须返回一个合法的空 ArrayBuffer，
-        // 否则 ArkTS 侧拿到未初始化句柄会直接 SIGSEGV
         OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "PhoneMicNr",
             "napi_create_arraybuffer failed st=%{public}d got=%{public}zu", (int)st, got);
-        ab = nullptr;
-        napi_create_arraybuffer(env, 0, nullptr, &ab);
-        return ab;
+        // 兜底：返回 undefined（ArkTS 侧有 instanceof 防御），绝不再返回坏句柄
+        napi_value und;
+        napi_get_undefined(env, &und);
+        return und;
     }
     if (got > 0) {
-        void* dst = nullptr;
-        napi_get_arraybuffer_info(env, ab, &dst, nullptr);
-        if (dst == nullptr) {
+        if (data == nullptr) {
+            // 官方文档：byte_length 为 0 或超大时 data 返回 nullptr，需判空
             OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "PhoneMicNr",
                 "arraybuffer data is null, got=%{public}zu", got);
         } else {
-            std::memcpy(dst, tmp.data(), got);
+            std::memcpy(data, tmp.data(), got);
         }
     }
     return ab;

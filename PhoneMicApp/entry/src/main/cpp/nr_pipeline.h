@@ -3,8 +3,14 @@
  * 拓扑：输入节点(APP供数 48k/mono/S16LE) → 降噪节点(202) → 输出节点(16k/mono/S16LE)
  * 驱动：native 渲染线程循环 RenderFrame()；输入经 RequestDataCallback 从
  *       环形队列取，输出写另一个环形队列，ArkTS 侧 pull() 取走。
- * 实时模式（AUDIOSUITE_PIPELINE_REALTIME_MODE）在 API 23+ 支持全部效果节点，
- * 本机 API 26 满足。
+ * 模式：必须 EDIT_MODE（离线编辑）。官方文档明确"实时预览场景仅支持均衡器
+ *       节点"，降噪节点(202)在 REALTIME_MODE 下真机实测输入回调不被调用、
+ *       RenderFrame 持续返回系统错误。EDIT_MODE 的驱动方式恰是"App 循环调
+ *       RenderFrame + 回调按需供数"，与本推流架构一致。
+ * 关键契约：EDIT_MODE 输入节点要求每次回调填满其 1920B 内部缓存，返回短包/0
+ *       会被当作输入流结束（EOS）且粘连——引擎此后不再回调、RenderFrame 永久
+ *       失败。故 OnRequestData 阻塞等满一帧（天然背压，管线实时化），
+ *       超时才补静音；连续断流 10s 才结束管线。
  */
 #ifndef PHONEMIC_NR_PIPELINE_H
 #define PHONEMIC_NR_PIPELINE_H
@@ -79,9 +85,15 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
 
-    // RequestDataCallback 的等待：队列够一帧才返回；stopping_ 或超时则放行
+    // RequestDataCallback 的等待：队列够一帧（引擎单次请求 1920B）才返回；
+    // stopping_ 或超时（补静音）则放行。持本锁写入+通知，配对无丢唤醒。
     std::mutex cvMutex_;
     std::condition_variable dataCv_;
+
+    // 断流保护：回调连续补静音的帧数；达到 kMaxStarveFrames 判定采集死亡，
+    // 回调置 finished 结束管线。inputEnded_ 供渲染循环区分退出原因。
+    std::atomic<int> starveFrames_{0};
+    std::atomic<bool> inputEnded_{false};
 
     RingBuffer inRing_{48000 * 2};   // 48kHz mono S16LE × 1s
     RingBuffer outRing_{16000 * 2};  // 16kHz mono S16LE × 1s
