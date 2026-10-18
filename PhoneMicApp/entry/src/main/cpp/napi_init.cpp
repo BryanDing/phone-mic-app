@@ -16,7 +16,36 @@ constexpr size_t kPullChunkBytes = 2048; // 每次 pull 最大字节（16k×2B�
 
 static napi_value NrInit(napi_env env, napi_callback_info info)
 {
-    int rc = NoiseReductionPipeline::Get().Init();
+    // 参数：(mode, vbType)。mode 0=引擎降噪 1=人声增强；vbType 1~4。
+    // 无参数调用时默认降噪模式（兼容旧调用）。
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t mode = 0;
+    int32_t vbType = 1;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &mode);
+    }
+    if (argc >= 2) {
+        napi_get_value_int32(env, argv[1], &vbType);
+    }
+    int rc = NoiseReductionPipeline::Get().Init(static_cast<int>(mode), static_cast<int>(vbType));
+    napi_value result;
+    napi_create_int32(env, rc, &result);
+    return result;
+}
+
+/** 热改人声美化预设（仅 VB 模式运行中有效）；成功返回 0。 */
+static napi_value NrSetVbType(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t vbType = 1;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &vbType);
+    }
+    int rc = NoiseReductionPipeline::Get().SetVoiceBeautifierType(static_cast<int>(vbType));
     napi_value result;
     napi_create_int32(env, rc, &result);
     return result;
@@ -107,8 +136,9 @@ static napi_value NrInfo(napi_env env, napi_callback_info info)
     auto& pl = NoiseReductionPipeline::Get();
     char buf[256];
     int n = snprintf(buf, sizeof(buf),
-        "running=%d in_backlog_ms=%d out_backlog_ms=%d overwritten=%llu",
-        pl.IsRunning() ? 1 : 0, pl.InputBacklogMs(), pl.OutputBacklogMs(),
+        "running=%d mode=%d vb_type=%d out_rate=%d in_backlog_ms=%d out_backlog_ms=%d overwritten=%llu",
+        pl.IsRunning() ? 1 : 0, pl.Mode(), pl.VbType(), pl.OutRate(),
+        pl.InputBacklogMs(), pl.OutputBacklogMs(),
         static_cast<unsigned long long>(pl.OverwrittenBytes()));
     napi_value s;
     napi_create_string_utf8(env, buf, (n > 0 ? n : 0), &s);
@@ -120,6 +150,7 @@ static napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor desc[] = {
         {"init", nullptr, NrInit, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setVbType", nullptr, NrSetVbType, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"release", nullptr, NrRelease, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"push", nullptr, NrPush, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"pull", nullptr, NrPull, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "ring_buffer.h"
 #include "ohaudiosuite/native_audio_suite_engine.h"
@@ -37,12 +38,26 @@ enum {
     NR_ERR_THREAD = -8,
 };
 
+// 管线模式（NAPI init 第一参数）
+enum {
+    // 输入(48k mono) → 降噪(202) → 输出(16k mono)，ArkTS 侧重采样回 48k
+    NR_MODE_NOISE_REDUCTION = 0,
+    // 输入(48k stereo) → 人声美化(205) → 输出(48k stereo)，
+    // native 下混单声道后直接按 48k 推流（全带音质，比重采样链路保真）
+    NR_MODE_VOICE_BEAUTIFIER = 1,
+};
+
 class NoiseReductionPipeline {
 public:
     static NoiseReductionPipeline& Get();
 
-    /** 创建引擎+管线+节点并启动。成功返回 NR_OK。 */
-    int Init();
+    /** 创建引擎+管线+节点并启动。成功返回 NR_OK。
+     * mode: NR_MODE_NOISE_REDUCTION(0) 或 NR_MODE_VOICE_BEAUTIFIER(1)。
+     * vbType: 人声美化预设 1~4（仅 VB 模式有意义）：1清澈 2剧院 3CD 4录音棚。 */
+    int Init(int mode = NR_MODE_NOISE_REDUCTION, int vbType = 1);
+
+    /** 热改人声美化预设（仅 VB 模式运行中有效）；成功返回 0。 */
+    int SetVoiceBeautifierType(int vbType);
 
     /** 停止并销毁全部资源，可再次 Init。 */
     void Release();
@@ -60,6 +75,13 @@ public:
     /** 累计被覆盖丢弃的输入字节（背压诊断）。 */
     uint64_t OverwrittenBytes() const;
 
+    /** 当前模式（NR_MODE_*；未 Init 时为默认降噪）。 */
+    int Mode() const { return mode_; }
+    /** 当前人声美化预设（1~4，仅 VB 模式有意义）。 */
+    int VbType() const { return vbType_; }
+    /** 输出环数据速率（NR=16000，VB=48000）。 */
+    int OutRate() const { return outRate_; }
+
     bool IsRunning() const { return running_.load(); }
 
 private:
@@ -69,6 +91,9 @@ private:
     NoiseReductionPipeline& operator=(const NoiseReductionPipeline&) = delete;
 
     int32_t OnRequestData(void* audioData, int32_t audioDataSize, bool* finished);
+    /** 把单声道数据填成引擎要的满帧（单声道直读 / 立体声 L=R 复制，剩余补零）。
+     *  调用方须持有 cvMutex_ 且已确认数据量（或显式允许部分填充）。 */
+    size_t FillFrame(void* audioData, size_t need, size_t needMono, bool allowPartial);
     void RenderLoop();
     void Teardown();
 
@@ -79,7 +104,16 @@ private:
     OH_AudioSuitePipeline* pipeline_ = nullptr;
     OH_AudioNode* inputNode_ = nullptr;
     OH_AudioNode* nrNode_ = nullptr;
+    OH_AudioNode* vbNode_ = nullptr;
     OH_AudioNode* outputNode_ = nullptr;
+
+    int mode_ = NR_MODE_NOISE_REDUCTION;
+    int vbType_ = 1;
+    // 输入节点声道数（NR=1，VB=2：VB 原生格式为 48k 立体声，
+    // 采集单声道在回调里复制成立体声喂入，避免依赖引擎的格式自适应）
+    int inputChannels_ = 1;
+    // 输出环数据速率（NR=16000，VB=48000），OutputBacklogMs 用
+    int outRate_ = 16000;
 
     std::thread renderThread_;
     std::atomic<bool> running_{false};
@@ -95,8 +129,11 @@ private:
     std::atomic<int> starveFrames_{0};
     std::atomic<bool> inputEnded_{false};
 
-    RingBuffer inRing_{48000 * 2};   // 48kHz mono S16LE × 1s
-    RingBuffer outRing_{16000 * 2};  // 16kHz mono S16LE × 1s
+    // VB 模式回调暂存：单声道读入后复制成立体声（避免在 audioData 里就地交错）
+    std::vector<uint8_t> monoScratch_;
+
+    RingBuffer inRing_{48000 * 2};   // 48kHz mono S16LE × 1s（采集侧始终单声道）
+    RingBuffer outRing_{48000 * 2};  // 单声道 S16LE × 1s（NR=16k / VB=48k 通用容量）
 };
 
 #endif // PHONEMIC_NR_PIPELINE_H

@@ -48,6 +48,23 @@ const SOURCE_MODES: SourceMode[] = [
   },
 ];
 
+// ---------- 人声增强预设（OHAudioSuite 205 人声美化节点，4 预设全量） ----------
+// 与引擎降噪（202 节点）互斥：两者格式契约不同（VB 输出 48k 立体声/native 已下混
+// 单声道直推；NR 输出 16k 单声道需重采样回 48k），且同时开启两个引擎管线会互相
+// 抢占采集数据。开关层面互斥，UI 上开启一个会自动关掉另一个。
+interface VbPreset {
+  type: number;   // 对应 OH_AudioSuiteEngine_SetVoiceBeautifierType 的 type
+  label: string;
+  hint: string;
+}
+
+const VB_TYPES: VbPreset[] = [
+  { type: 1, label: '清澈', hint: 'CLEAR：突出人声清晰度，口播/网课首选' },
+  { type: 2, label: '剧院', hint: 'THEATRE：增加空间感，适合有场景感的讲述' },
+  { type: 3, label: 'CD', hint: 'CD：整体更均衡耐听，微暖' },
+  { type: 4, label: '录音棚', hint: 'RECORDING_STUDIO：录音棚级人声厚度' },
+];
+
 // ---------- 重采样器状态（两套：系统降采样还原、引擎降噪输出还原） ----------
 interface RsState {
   queue: number[];   // 待消费的输入样本（int16）
@@ -108,6 +125,8 @@ struct Index {
   @State serverPort: string = AppStorage.get<string>('pm_serverPort') ?? '5000';
   @State sourceKey: string = AppStorage.get<string>('pm_sourceKey') ?? 'mic';
   @State nrEnabled: boolean = AppStorage.get<boolean>('pm_nrEnabled') ?? false;
+  @State vbEnabled: boolean = AppStorage.get<boolean>('pm_vbEnabled') ?? false;
+  @State vbType: number = AppStorage.get<number>('pm_vbType') ?? 1;
   @State status: string = '未开始';
   @State streaming: boolean = false;
   @State level: number = 0;
@@ -126,9 +145,10 @@ struct Index {
   private rsEnabled: boolean = false;
   private rsState: RsState = { queue: [], pos: 0 };
 
-  // 引擎降噪（Phase 2）：native 管线输出 16kHz，用第二套重采样状态拉回 48kHz
+  // 引擎处理（Phase 2）：降噪/人声增强共用一条 native 管线，互斥使用
   private nrActive: boolean = false;   // 本次推流中 nr.init() 是否成功
-  private nrRsState: RsState = { queue: [], pos: 0 };
+  private nrMode: number = 0;          // 本次实际链路：0=引擎降噪 1=人声增强
+  private nrRsState: RsState = { queue: [], pos: 0 };  // 仅降噪模式用（16k→48k）
   private nrOutFrames: number = 0;
 
   build() {
@@ -203,7 +223,7 @@ struct Index {
               .fontSize(14)
               .fontColor('#333333')
               .width('100%')
-            Text('系统级 AI 降噪算法，可叠加在任意音源档位上；引擎固定 16kHz 输出，APP 自动还原 48kHz 推流。与"系统3A"叠加官方不建议，仅作对比测试。')
+            Text('系统级 AI 降噪算法，可叠加在任意音源档位上；引擎固定 16kHz 输出，APP 自动还原 48kHz 推流。与"系统3A"叠加官方不建议，仅作对比测试。与下方"人声增强"互斥。')
               .fontSize(11)
               .fontColor('#999999')
               .width('100%')
@@ -217,6 +237,57 @@ struct Index {
         }
         .width('100%')
         .margin({ top: 10 })
+
+        // Phase 2：人声增强（OHAudioSuite 205 人声美化节点）
+        Row({ space: 10 }) {
+          Column({ space: 2 }) {
+            Text('人声增强（Phase 2 实验）')
+              .fontSize(14)
+              .fontColor('#333333')
+              .width('100%')
+            Text('人声美化引擎，48kHz 全带输出、不做重采样（音质优先）。与"引擎降噪"互斥：开启会自动关掉降噪。建议与原声档对比后选用。')
+              .fontSize(11)
+              .fontColor('#999999')
+              .width('100%')
+          }
+          .layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.vbEnabled })
+            .id('vbToggle')
+            .onChange((on: boolean) => {
+              this.onVbToggle(on);
+            })
+        }
+        .width('100%')
+        .margin({ top: 10 })
+
+        // 人声增强预设（未开启时置灰）
+        Text('人声增强预设')
+          .fontSize(14)
+          .fontColor('#333333')
+          .width('100%')
+          .margin({ top: 8 })
+          .opacity(this.vbEnabled ? 1 : 0.4)
+        Flex({ wrap: FlexWrap.Wrap }) {
+          ForEach(VB_TYPES, (t: VbPreset) => {
+            Button(t.label)
+              .fontSize(13)
+              .height(34)
+              .padding({ left: 12, right: 12 })
+              .type(ButtonType.Capsule)
+              .margin({ right: 8, bottom: 8 })
+              .backgroundColor(this.vbType === t.type ? '#5B5BD6' : '#EFEFEF')
+              .fontColor(this.vbType === t.type ? '#FFFFFF' : '#333333')
+              .enabled(this.vbEnabled)
+              .onClick(() => {
+                this.onVbTypeChange(t.type);
+              })
+          }, (t: VbPreset) => String(t.type))
+        }
+        .width('100%')
+        Text(this.vbHint())
+          .fontSize(11)
+          .fontColor('#999999')
+          .width('100%')
 
         Button(this.streaming ? '停止推流' : '开始推流')
           .fontSize(18)
@@ -314,10 +385,15 @@ struct Index {
     }
   }
 
-  // ---------- 引擎降噪开关（Phase 2） ----------
+  // ---------- 引擎降噪开关（Phase 2，与人声增强互斥） ----------
   private async onNrToggle(on: boolean): Promise<void> {
     this.nrEnabled = on;
     AppStorage.set('pm_nrEnabled', on);
+    if (on && this.vbEnabled) {
+      // 互斥：开引擎降噪则关人声增强
+      this.vbEnabled = false;
+      AppStorage.set('pm_vbEnabled', false);
+    }
     if (!this.streaming) {
       this.status = on ? '引擎降噪已开启（下次推流生效）' : '引擎降噪已关闭（下次推流生效）';
       return;
@@ -325,7 +401,7 @@ struct Index {
     // 推流中切换：重建 native 管线，约半秒间断
     this.status = on ? '正在启动引擎降噪…' : '正在关闭引擎降噪…';
     if (on) {
-      const rc: number = await this.nrInitForStream();
+      const rc: number = await this.nrInitForStream(0, this.vbType);
       if (rc !== 0) {
         this.nrEnabled = false;
         AppStorage.set('pm_nrEnabled', false);
@@ -340,15 +416,86 @@ struct Index {
     this.refreshDspInfo();
   }
 
-  /** 初始化 native 降噪管线；成功返回 0，失败返回负错误码并保持 nrActive=false。 */
-  private async nrInitForStream(): Promise<number> {
+  // ---------- 人声增强开关（Phase 2，与引擎降噪互斥） ----------
+  private async onVbToggle(on: boolean): Promise<void> {
+    this.vbEnabled = on;
+    AppStorage.set('pm_vbEnabled', on);
+    if (on && this.nrEnabled) {
+      // 互斥：开人声增强则关引擎降噪
+      this.nrEnabled = false;
+      AppStorage.set('pm_nrEnabled', false);
+    }
+    if (!this.streaming) {
+      this.status = on ? '人声增强已开启（下次推流生效）' : '人声增强已关闭（下次推流生效）';
+      return;
+    }
+    this.status = on ? '正在启动人声增强…' : '正在关闭人声增强…';
+    if (on) {
+      const rc: number = await this.nrInitForStream(1, this.vbType);
+      if (rc !== 0) {
+        this.vbEnabled = false;
+        AppStorage.set('pm_vbEnabled', false);
+        this.status = '人声增强启动失败(' + rc + ')，已关闭';
+      } else {
+        this.status = '人声增强已开启（' + this.vbLabel() + '），推流中…';
+      }
+    } else {
+      this.nrStop();
+      this.status = '人声增强已关闭，推流中…';
+    }
+    this.refreshDspInfo();
+  }
+
+  /** 人声增强预设切换：未开启只记忆；推流中优先热改，失败回落重建管线。 */
+  private async onVbTypeChange(t: number): Promise<void> {
+    if (t === this.vbType) {
+      return;
+    }
+    this.vbType = t;
+    AppStorage.set('pm_vbType', t);
+    if (!this.vbEnabled) {
+      this.status = '已选择人声预设：' + this.vbLabel() + '（开启人声增强后生效）';
+      return;
+    }
+    if (!this.streaming || !this.nrActive || this.nrMode !== 1) {
+      this.status = '人声预设：' + this.vbLabel() + '（下次推流生效）';
+      return;
+    }
+    // 推流中 + VB 运行中：先热改（无间断），失败回落整条重建
+    const rc: number = nr.setVbType(t);
+    if (rc === 0) {
+      this.status = '人声预设已切换：' + this.vbLabel();
+    } else {
+      const rc2: number = await this.nrInitForStream(1, t);
+      this.status = rc2 === 0
+        ? '人声预设已切换：' + this.vbLabel() + '（热改失败已重建管线）'
+        : '人声预设切换失败(' + rc + '/' + rc2 + ')';
+    }
+    this.refreshDspInfo();
+  }
+
+  private vbLabel(): string {
+    const t: VbPreset | undefined = VB_TYPES.find((x: VbPreset) => x.type === this.vbType);
+    return t ? t.label : '清澈';
+  }
+
+  private vbHint(): string {
+    const t: VbPreset | undefined = VB_TYPES.find((x: VbPreset) => x.type === this.vbType);
+    const hint: string = t ? t.hint : '';
+    return this.vbEnabled ? hint + '（推流中点击预设即时切换）' : hint + '（开启人声增强后可切换）';
+  }
+
+  /** 初始化 native 引擎管线；成功返回 0，失败返回负错误码并保持 nrActive=false。
+   *  mode: 0=引擎降噪（输出16k，需重采样回48k） 1=人声增强（输出48k 直推）。 */
+  private async nrInitForStream(mode: number, vbType: number): Promise<number> {
     this.nrStop(); // 防御：清理可能残留的旧管线
-    const rc: number = nr.init();
+    const rc: number = nr.init(mode, vbType);
     if (rc !== 0) {
       this.nrActive = false;
       return rc;
     }
     this.nrActive = true;
+    this.nrMode = mode;
     this.nrRsState = { queue: [], pos: 0 };
     this.nrOutFrames = 0;
     // 预热：等引擎产出第一批数据（最多 800ms），避免推流头上一小段没声音
@@ -445,19 +592,27 @@ struct Index {
       this.startedAt = Date.now();
       this.cbCount = 0;
 
-      // 5. 引擎降噪（Phase 2）：失败则自动回退纯推流，保证功能可用
-      if (this.nrEnabled) {
-        const rc: number = await this.nrInitForStream();
+      // 5. 引擎处理（Phase 2）：引擎降噪 / 人声增强（互斥）；失败自动回退纯推流
+      if (this.nrEnabled || this.vbEnabled) {
+        const rc: number = await this.nrInitForStream(this.vbEnabled ? 1 : 0, this.vbType);
         if (rc !== 0) {
-          this.nrEnabled = false;
-          AppStorage.set('pm_nrEnabled', false);
-          this.status = '引擎降噪启动失败(' + rc + ')，本次按普通推流';
+          if (this.vbEnabled) {
+            this.vbEnabled = false;
+            AppStorage.set('pm_vbEnabled', false);
+            this.status = '人声增强启动失败(' + rc + ')，本次按普通推流';
+          } else {
+            this.nrEnabled = false;
+            AppStorage.set('pm_nrEnabled', false);
+            this.status = '引擎降噪启动失败(' + rc + ')，本次按普通推流';
+          }
         }
       }
       this.refreshDspInfo();
-      if (this.status.indexOf('引擎降噪启动失败') < 0) {
+      if (this.status.indexOf('启动失败') < 0) {
         this.status = '已连接，推流中…（音源：' + this.currentMode().label
-          + (this.nrActive ? ' ｜ 引擎降噪开' : '') + '）';
+          + (this.nrActive
+            ? (this.nrMode === 1 ? ' ｜ 人声增强：' + this.vbLabel() : ' ｜ 引擎降噪开')
+            : '') + '）';
       }
     } catch (e) {
       this.status = '连接失败: ' + this.errMsg(e) + '（检查 IP、端口和电脑防火墙）';
@@ -560,10 +715,14 @@ struct Index {
   private refreshDspInfo(): void {
     let s: string = '实际采集：' + this.actualRate + ' Hz'
       + (this.rsEnabled ? '（已重采样回 48000 推流）' : '');
-    if (this.nrActive) {
+    if (this.nrActive && this.nrMode === 1) {
+      s += ' ｜ 人声增强：开（' + this.vbLabel() + '，48k 直推）';
+    } else if (this.nrActive) {
       s += ' ｜ 引擎降噪：开（输出 16k 已还原 48k）';
     } else if (this.nrEnabled) {
       s += ' ｜ 引擎降噪：启动失败';
+    } else if (this.vbEnabled) {
+      s += ' ｜ 人声增强：启动失败';
     }
     this.dspInfo = s;
   }
@@ -610,23 +769,29 @@ struct Index {
       }
       payload = up;
     }
-    // 第二级：引擎降噪——送 native 管线，拉回 16kHz 结果再重采样回 48kHz
+    // 第二级：引擎处理——降噪（16k 输出需重采样）或人声增强（48k 直推）
     if (this.nrActive) {
       const backlog: number = nr.push(payload);
       if (backlog > 300 && this.cbCount % 20 === 0) {
-        this.status = '引擎降噪处理积压 ' + backlog + ' ms（实时性可能下降）';
+        this.status = '引擎处理积压 ' + backlog + ' ms（实时性可能下降）';
       }
       const out: ArrayBuffer = nr.pull();
       // 三重防御：坏对象 / 空缓冲都直接丢帧——DataView 构造对未初始化句柄会 SIGSEGV
       if (!(out instanceof ArrayBuffer) || out.byteLength === 0) {
         return; // 管线预热/欠载，本帧不发送
       }
-      const up: ArrayBuffer | null = resampleChunk(out, this.nrRsState, NR_RATE);
-      if (up === null) {
-        return;
+      if (this.nrMode === 1) {
+        // 人声增强：native 已输出 48kHz 单声道（立体声下混），直接推流不走重采样
+        this.nrOutFrames += out.byteLength;
+        payload = out;
+      } else {
+        const up: ArrayBuffer | null = resampleChunk(out, this.nrRsState, NR_RATE);
+        if (up === null) {
+          return;
+        }
+        this.nrOutFrames += up.byteLength;
+        payload = up;
       }
-      this.nrOutFrames += up.byteLength;
-      payload = up;
     }
     try {
       tcp.send({ data: payload }).catch((err: BusinessError) => {

@@ -48,21 +48,39 @@ NoiseReductionPipeline& NoiseReductionPipeline::Get()
     return inst;
 }
 
-int NoiseReductionPipeline::Init()
+int NoiseReductionPipeline::Init(int mode, int vbType)
 {
     if (running_.load()) {
         return NR_ERR_ALREADY;
     }
+    // 模式参数归一化（非法值回落默认，绝不因此失败）
+    mode_ = (mode == NR_MODE_VOICE_BEAUTIFIER) ? NR_MODE_VOICE_BEAUTIFIER : NR_MODE_NOISE_REDUCTION;
+    vbType_ = (vbType >= 1 && vbType <= 4) ? vbType : 1;
+    inputChannels_ = (mode_ == NR_MODE_VOICE_BEAUTIFIER) ? 2 : 1;
+    outRate_ = (mode_ == NR_MODE_VOICE_BEAUTIFIER) ? 48000 : 16000;
+    NR_LOGD("init begin: mode=%{public}d vbType=%{public}d inCh=%{public}d outRate=%{public}d",
+        mode_, vbType_, inputChannels_, outRate_);
 
-    // 1. 降噪节点支持性检查（202）
+    // 1. 效果节点支持性检查（按模式：降噪 202 / 人声美化 205）
+    const OH_AudioNode_Type wantNode = (mode_ == NR_MODE_VOICE_BEAUTIFIER)
+        ? EFFECT_NODE_TYPE_VOICE_BEAUTIFIER : EFFECT_NODE_TYPE_NOISE_REDUCTION;
     bool supported = false;
-    if (OH_AudioSuiteEngine_IsNodeTypeSupported(EFFECT_NODE_TYPE_NOISE_REDUCTION, &supported)
-            != AUDIOSUITE_SUCCESS
-        || !supported) {
-        NR_LOGE("noise reduction node not supported");
+    if (OH_AudioSuiteEngine_IsNodeTypeSupported(wantNode, &supported) != AUDIOSUITE_SUCCESS
+            || !supported) {
+        NR_LOGE("node type %{public}d not supported", wantNode);
         return NR_ERR_NODE_UNSUPPORTED;
     }
-    NR_LOGD("step1: node type supported");
+    NR_LOGD("step1: node type %{public}d supported", wantNode);
+
+    // 1.5 （原 VB→NR / NR→VB 直连串联探测已移除）
+    // 2026-10-18 真机实证：VB(205) 直连 NR(202) 时引擎内部
+    // VoiceMorphing algo apply 失败(-94) → SuitePipeline 线程 SIGSEGV(11)，
+    // 整个进程被杀（用户日志：AudioSuiteVoiceMorphingAlgoInte Apply failed
+    // → AudioSuitePorcessNode SignalProcess Apply failed → DFX signo 11）。
+    // 结论：叠加不可行——与格式契约分析一致（VB 出 48k 立体声 /
+    // NR 期望 48k 单声道，ConnectNodes 无格式协商承诺）。产品层面
+    // 两效果互斥；若未来要做叠加，需经 native_audio_converter.h
+    // (API 26) 做声道/采样率中转，且必须先在小流量实验包验证。
 
     // 2. 引擎
     if (OH_AudioSuiteEngine_Create(&engine_) != AUDIOSUITE_SUCCESS || engine_ == nullptr) {
@@ -93,11 +111,14 @@ int NoiseReductionPipeline::Init()
         return NR_ERR_NODE_CREATE;
     }
 
-    // 4. 输入节点：48kHz / 单声道 / S16LE（APP 写入格式）
+    // 4. 输入节点。
+    // NR 模式：48k 单声道（降噪节点内部重采样到 16k）。
+    // VB 模式：48k 立体声——人声美化节点原生格式即 48k 立体声，
+    // 采集单声道在 OnRequestData 里复制成立体声喂入，不依赖引擎的格式自适应。
     OH_AudioFormat inFmt{};
     inFmt.samplingRate = SAMPLE_RATE_48000;
-    inFmt.channelLayout = CH_LAYOUT_MONO;
-    inFmt.channelCount = 1;
+    inFmt.channelLayout = (inputChannels_ == 2) ? CH_LAYOUT_STEREO : CH_LAYOUT_MONO;
+    inFmt.channelCount = inputChannels_;
     inFmt.encodingType = AUDIO_ENCODING_TYPE_RAW;
     inFmt.sampleFormat = AUDIO_SAMPLE_S16LE;
     if (OH_AudioSuiteNodeBuilder_SetNodeType(builder, INPUT_NODE_TYPE_DEFAULT) != AUDIOSUITE_SUCCESS
@@ -110,44 +131,93 @@ int NoiseReductionPipeline::Init()
         Teardown();
         return NR_ERR_NODE_CREATE;
     }
+    NR_LOGD("step4: input node created (%{public}d ch)", inputChannels_);
 
-    // 5. 降噪节点（202，无参数）
-    if (OH_AudioSuiteNodeBuilder_Reset(builder) != AUDIOSUITE_SUCCESS
-        || OH_AudioSuiteNodeBuilder_SetNodeType(builder, EFFECT_NODE_TYPE_NOISE_REDUCTION) != AUDIOSUITE_SUCCESS
-        || OH_AudioSuiteEngine_CreateNode(pipeline_, builder, &nrNode_) != AUDIOSUITE_SUCCESS) {
-        NR_LOGE("nr node create failed");
+    if (mode_ == NR_MODE_VOICE_BEAUTIFIER) {
+        // 5. 人声美化节点（205，无格式参数；建后设预设）
+        if (OH_AudioSuiteNodeBuilder_Reset(builder) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteNodeBuilder_SetNodeType(builder, EFFECT_NODE_TYPE_VOICE_BEAUTIFIER) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteEngine_CreateNode(pipeline_, builder, &vbNode_) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("vb node create failed");
+            OH_AudioSuiteNodeBuilder_Destroy(builder);
+            Teardown();
+            return NR_ERR_NODE_CREATE;
+        }
+        if (OH_AudioSuiteEngine_SetVoiceBeautifierType(vbNode_,
+                static_cast<OH_VoiceBeautifierType>(vbType_)) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("set voice beautifier type %{public}d failed", vbType_);
+            OH_AudioSuiteNodeBuilder_Destroy(builder);
+            Teardown();
+            return NR_ERR_NODE_CREATE;
+        }
+        NR_LOGD("step5: vb node created, type=%{public}d", vbType_);
+
+        // 6. 输出节点：48kHz / 立体声 / S16LE（人声美化输出原生格式，
+        // RenderLoop 里再下混单声道写入输出环）
+        OH_AudioFormat outFmt{};
+        outFmt.samplingRate = SAMPLE_RATE_48000;
+        outFmt.channelLayout = CH_LAYOUT_STEREO;
+        outFmt.channelCount = 2;
+        outFmt.encodingType = AUDIO_ENCODING_TYPE_RAW;
+        outFmt.sampleFormat = AUDIO_SAMPLE_S16LE;
+        if (OH_AudioSuiteNodeBuilder_Reset(builder) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteNodeBuilder_SetNodeType(builder, OUTPUT_NODE_TYPE_DEFAULT) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteNodeBuilder_SetFormat(builder, outFmt) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteEngine_CreateNode(pipeline_, builder, &outputNode_) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("output node create failed");
+            OH_AudioSuiteNodeBuilder_Destroy(builder);
+            Teardown();
+            return NR_ERR_NODE_CREATE;
+        }
         OH_AudioSuiteNodeBuilder_Destroy(builder);
-        Teardown();
-        return NR_ERR_NODE_CREATE;
-    }
+        NR_LOGD("step6: output node created (48k stereo)");
 
-    NR_LOGD("step5: nr node created");
+        // 7. 连接：输入 → 人声美化 → 输出
+        if (OH_AudioSuiteEngine_ConnectNodes(inputNode_, vbNode_) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteEngine_ConnectNodes(vbNode_, outputNode_) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("connect nodes failed");
+            Teardown();
+            return NR_ERR_CONNECT;
+        }
+    } else {
+        // 5. 降噪节点（202，无参数）
+        if (OH_AudioSuiteNodeBuilder_Reset(builder) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteNodeBuilder_SetNodeType(builder, EFFECT_NODE_TYPE_NOISE_REDUCTION) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteEngine_CreateNode(pipeline_, builder, &nrNode_) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("nr node create failed");
+            OH_AudioSuiteNodeBuilder_Destroy(builder);
+            Teardown();
+            return NR_ERR_NODE_CREATE;
+        }
 
-    // 6. 输出节点：16kHz / 单声道 / S16LE（降噪节点输出固定格式）
-    OH_AudioFormat outFmt{};
-    outFmt.samplingRate = SAMPLE_RATE_16000;
-    outFmt.channelLayout = CH_LAYOUT_MONO;
-    outFmt.channelCount = 1;
-    outFmt.encodingType = AUDIO_ENCODING_TYPE_RAW;
-    outFmt.sampleFormat = AUDIO_SAMPLE_S16LE;
-    if (OH_AudioSuiteNodeBuilder_Reset(builder) != AUDIOSUITE_SUCCESS
-        || OH_AudioSuiteNodeBuilder_SetNodeType(builder, OUTPUT_NODE_TYPE_DEFAULT) != AUDIOSUITE_SUCCESS
-        || OH_AudioSuiteNodeBuilder_SetFormat(builder, outFmt) != AUDIOSUITE_SUCCESS
-        || OH_AudioSuiteEngine_CreateNode(pipeline_, builder, &outputNode_) != AUDIOSUITE_SUCCESS) {
-        NR_LOGE("output node create failed");
+        NR_LOGD("step5: nr node created");
+
+        // 6. 输出节点：16kHz / 单声道 / S16LE（降噪节点输出固定格式）
+        OH_AudioFormat outFmt{};
+        outFmt.samplingRate = SAMPLE_RATE_16000;
+        outFmt.channelLayout = CH_LAYOUT_MONO;
+        outFmt.channelCount = 1;
+        outFmt.encodingType = AUDIO_ENCODING_TYPE_RAW;
+        outFmt.sampleFormat = AUDIO_SAMPLE_S16LE;
+        if (OH_AudioSuiteNodeBuilder_Reset(builder) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteNodeBuilder_SetNodeType(builder, OUTPUT_NODE_TYPE_DEFAULT) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteNodeBuilder_SetFormat(builder, outFmt) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteEngine_CreateNode(pipeline_, builder, &outputNode_) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("output node create failed");
+            OH_AudioSuiteNodeBuilder_Destroy(builder);
+            Teardown();
+            return NR_ERR_NODE_CREATE;
+        }
         OH_AudioSuiteNodeBuilder_Destroy(builder);
-        Teardown();
-        return NR_ERR_NODE_CREATE;
-    }
-    OH_AudioSuiteNodeBuilder_Destroy(builder);
-    NR_LOGD("step6: output node created");
+        NR_LOGD("step6: output node created");
 
-    // 7. 连接：输入 → 降噪 → 输出
-    if (OH_AudioSuiteEngine_ConnectNodes(inputNode_, nrNode_) != AUDIOSUITE_SUCCESS
-        || OH_AudioSuiteEngine_ConnectNodes(nrNode_, outputNode_) != AUDIOSUITE_SUCCESS) {
-        NR_LOGE("connect nodes failed");
-        Teardown();
-        return NR_ERR_CONNECT;
+        // 7. 连接：输入 → 降噪 → 输出
+        if (OH_AudioSuiteEngine_ConnectNodes(inputNode_, nrNode_) != AUDIOSUITE_SUCCESS
+            || OH_AudioSuiteEngine_ConnectNodes(nrNode_, outputNode_) != AUDIOSUITE_SUCCESS) {
+            NR_LOGE("connect nodes failed");
+            Teardown();
+            return NR_ERR_CONNECT;
+        }
     }
     NR_LOGD("step7: nodes connected");
 
@@ -202,8 +272,14 @@ int32_t NoiseReductionPipeline::OnRequestData(void* audioData, int32_t audioData
         // 引擎不会这么调（singleRequestSize_=1920），纯防御
         return 0;
     }
+    // 环形队列里始终是单声道（采集侧约定）；VB 模式输入节点是立体声，
+    // 引擎要的字节数除以声道数才是需要等待的单声道字节数。
+    const size_t needMono = need / static_cast<size_t>(inputChannels_);
+    if (needMono == 0) {
+        return 0;
+    }
 
-    // 【核心契约】EDIT_MODE 输入节点要求每次回调填满其 1920B 内部缓存。
+    // 【核心契约】EDIT_MODE 输入节点要求每次回调填满其内部缓存。
     // 返回不足一帧（短包或 0）会被引擎当作输入流结束（EOS）且粘连：
     // 真机日志实证——短包后 GeneratePushBuffer cachedBuffer not data0 →
     // RenderFrame ret=-62980096（错误 3），且引擎此后再不调用本回调，
@@ -213,17 +289,17 @@ int32_t NoiseReductionPipeline::OnRequestData(void* audioData, int32_t audioData
     // （AudioCapturer 线程 → push → notify）与引擎线程完全独立。
     std::unique_lock<std::mutex> lk(cvMutex_);
     dataCv_.wait_for(lk, std::chrono::milliseconds(kRequestWaitMs), [&] {
-        return stopping_.load() || inRing_.available() >= need;
+        return stopping_.load() || inRing_.available() >= needMono;
     });
     if (stopping_.load()) {
         *finished = true;
         return 0;
     }
 
-    size_t got = 0;
+    size_t got = 0; // 实际填入 audioData 的字节数（含声道扩展）
     size_t avail = inRing_.available();
-    if (avail >= need) {
-        got = inRing_.read(static_cast<uint8_t*>(audioData), need);
+    if (avail >= needMono) {
+        got = FillFrame(audioData, need, needMono, /*allowPartial=*/false);
         starveFrames_.store(0);
     } else {
         // 超时仍凑不满：采集侧断流（权限被收回/音频焦点被抢/退后台）。
@@ -236,11 +312,7 @@ int32_t NoiseReductionPipeline::OnRequestData(void* audioData, int32_t audioData
             *finished = true;
             return 0;
         }
-        if (avail > 0) {
-            got = inRing_.read(static_cast<uint8_t*>(audioData), avail);
-        }
-        std::memset(static_cast<uint8_t*>(audioData) + got, 0, need - got);
-        got = need;
+        got = FillFrame(audioData, need, needMono, /*allowPartial=*/true);
         if (n <= 100 || n % 500 == 0) {
             NR_LOGW("OnRequestData #%{public}llu: starved, filled %{public}u bytes silence (starve=%{public}d)",
                 static_cast<unsigned long long>(n), static_cast<unsigned>(got), starve);
@@ -255,13 +327,47 @@ int32_t NoiseReductionPipeline::OnRequestData(void* audioData, int32_t audioData
     return static_cast<int32_t>(got);
 }
 
+size_t NoiseReductionPipeline::FillFrame(void* audioData, size_t need, size_t needMono, bool allowPartial)
+{
+    // 把单声道数据填成引擎要的满帧：单声道模式直接读；立体声模式读入
+    // 暂存区后按 L=R 复制。allowPartial=false 时调用方已保证 avail>=needMono；
+    // allowPartial=true 时吃下现有全部，剩余补零（断流保命路径）。
+    if (inputChannels_ <= 1) {
+        size_t gotMono = inRing_.read(static_cast<uint8_t*>(audioData),
+            allowPartial ? inRing_.available() : needMono);
+        if (allowPartial && gotMono < need) {
+            std::memset(static_cast<uint8_t*>(audioData) + gotMono, 0, need - gotMono);
+        }
+        return allowPartial ? need : gotMono;
+    }
+    // 立体声：先读单声道（最多 needMono），再交错复制
+    const size_t wantMono = allowPartial ? inRing_.available() : needMono;
+    if (wantMono > 0) {
+        if (monoScratch_.size() < wantMono) {
+            monoScratch_.resize(wantMono);
+        }
+    }
+    size_t gotMono = (wantMono > 0) ? inRing_.read(monoScratch_.data(), wantMono) : 0;
+    const int16_t* src = reinterpret_cast<const int16_t*>(monoScratch_.data());
+    int16_t* dst = static_cast<int16_t*>(audioData);
+    const size_t frames = need / (2 * sizeof(int16_t)); // 立体声 S16 帧数
+    const size_t gotFrames = gotMono / sizeof(int16_t);
+    for (size_t i = 0; i < frames; i++) {
+        const int16_t v = (i < gotFrames) ? src[i] : 0;
+        dst[2 * i] = v;
+        dst[2 * i + 1] = v;
+    }
+    return need;
+}
+
 void NoiseReductionPipeline::RenderLoop()
 {
     std::vector<uint8_t> buf(kRenderRequestBytes);
+    std::vector<int16_t> monoBuf; // VB 模式立体声下混暂存
     int consecutiveErrors = 0;
     uint64_t iter = 0;
     while (!stopping_.load()) {
-        // 数据门禁：输入环不足一帧（20ms）时等待，绝不带着空环调 RenderFrame。
+        // 数据门禁：输入环不足一帧（20ms 单声道）时等待，绝不带着空环调 RenderFrame。
         // 引擎欠载时会返回系统错误而非空响应，预热/卡顿期都可能触发。
         if (inRing_.available() < kMinInputBytes) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -287,7 +393,26 @@ void NoiseReductionPipeline::RenderLoop()
         }
         consecutiveErrors = 0;
         if (resp > 0) {
-            outRing_.write(buf.data(), static_cast<size_t>(resp));
+            if (mode_ == NR_MODE_VOICE_BEAUTIFIER) {
+                // VB 输出 48k 立体声 S16LE → (L+R)/2 下混单声道写入输出环，
+                // ArkTS 侧直接按 48k 推流（无需重采样，全带音质）
+                const size_t frames = static_cast<size_t>(resp) / (2 * sizeof(int16_t));
+                if (frames > 0) {
+                    if (monoBuf.size() < frames) {
+                        monoBuf.resize(frames);
+                    }
+                    const int16_t* s = reinterpret_cast<const int16_t*>(buf.data());
+                    for (size_t i = 0; i < frames; i++) {
+                        const int32_t l = s[2 * i];
+                        const int32_t rr = s[2 * i + 1];
+                        monoBuf[i] = static_cast<int16_t>((l + rr) / 2);
+                    }
+                    outRing_.write(reinterpret_cast<const uint8_t*>(monoBuf.data()),
+                        frames * sizeof(int16_t));
+                }
+            } else {
+                outRing_.write(buf.data(), static_cast<size_t>(resp));
+            }
         }
         if (finished) {
             break;
@@ -337,6 +462,10 @@ void NoiseReductionPipeline::Teardown()
     if (nrNode_ != nullptr) {
         OH_AudioSuiteEngine_DestroyNode(nrNode_);
         nrNode_ = nullptr;
+    }
+    if (vbNode_ != nullptr) {
+        OH_AudioSuiteEngine_DestroyNode(vbNode_);
+        vbNode_ = nullptr;
     }
     if (outputNode_ != nullptr) {
         OH_AudioSuiteEngine_DestroyNode(outputNode_);
@@ -392,10 +521,31 @@ int NoiseReductionPipeline::InputBacklogMs() const
 
 int NoiseReductionPipeline::OutputBacklogMs() const
 {
-    return static_cast<int>(outRing_.available() / 32); // 16kHz×2B = 32 B/ms
+    // 输出环速率随模式变化（NR=16k，VB=48k）
+    return static_cast<int>(outRing_.available() / (static_cast<size_t>(outRate_) * 2));
 }
 
 uint64_t NoiseReductionPipeline::OverwrittenBytes() const
 {
     return inRing_.overwritten();
 }
+
+int NoiseReductionPipeline::SetVoiceBeautifierType(int vbType)
+{
+    if (vbType < 1 || vbType > 4) {
+        return -1;
+    }
+    if (!running_.load() || mode_ != NR_MODE_VOICE_BEAUTIFIER || vbNode_ == nullptr) {
+        return -2; // 非 VB 模式或未运行：调用方应回落重建管线
+    }
+    OH_AudioSuite_Result r = OH_AudioSuiteEngine_SetVoiceBeautifierType(vbNode_,
+        static_cast<OH_VoiceBeautifierType>(vbType));
+    if (r != AUDIOSUITE_SUCCESS) {
+        NR_LOGE("hot set vb type %{public}d failed r=%{public}d", vbType, static_cast<int>(r));
+        return -3;
+    }
+    vbType_ = vbType;
+    NR_LOGD("hot set vb type=%{public}d ok", vbType);
+    return 0;
+}
+
