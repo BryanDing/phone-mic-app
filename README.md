@@ -143,6 +143,35 @@ python denoise_click.py 录音.mp4 --preset light --ab
 
 ---
 
+## 九、引擎降噪（Phase 2：OHAudioSuite 原生 AI 降噪）
+
+档位切换借的是系统场景链路，算法不透明。Phase 2 直接调用系统音频引擎
+**OHAudioSuite**（Audio Kit）的降噪节点，与档位正交、可叠加在任意档位上：
+
+| 项目 | 说明 |
+|---|---|
+| 实现 | native C++ 模块（`entry/src/main/cpp/`，NAPI 导出 `libentry_nr.so`） |
+| 拓扑 | 输入节点(APP 供数 48k/单声道) → 降噪节点(202) → 输出节点(**16k/单声道**) |
+| 模式 | 实时渲染管线（API 23+ 支持全部效果节点，本机 API 26 满足） |
+| 音质 | 引擎输出固定 16kHz——**比档位方案的 48kHz 带宽低**，这是算法决定的 |
+
+两个自动保护（与第八节一致的理念）：
+1. **16k→48k 自动还原**：App 检测到引擎输出是 16kHz，线性插值重采样回 48kHz 再走 TCP，PC 接收端零改动
+2. **失败自动回退**：`nr.init()` 失败（引擎创建失败/降噪节点不支持等）自动关闭开关，按普通推流继续，功能永远可用
+
+界面"引擎降噪"开关位于音源档位下方，可随时热切换（推流中切换约半秒间断）。
+与"系统3A"档叠加官方不建议（重复处理），仅供对比测试。
+
+**验证方法**：与第八节相同——`python phone_mic_receiver.py --save 引擎降噪.raw`，
+重点对比"原声档 vs 原声+引擎降噪 vs 系统3A"三者的噪声底与音色。
+
+**构建说明**：native 编译需要在 `entry/build-profile.json5` 配置
+`buildOption.externalNativeOptions`（hvigor 才会执行 CMake 任务）；
+直接调 hvigorw.js 时需在 PATH 中加入 DevEco 自带 JDK（`jbr/bin`，打包工具要 java）
+并设置 `DEVECO_SDK_HOME`。
+
+---
+
 ## 附：实测记录（2026-10-17）
 
 - 电脑端：本地测试音 1.5 秒收到 0.14 MB ≈ 48000×2×1.5 理论值，音量条正常，断连正常

@@ -2,10 +2,13 @@ import { audio } from '@kit.AudioKit';
 import { socket } from '@kit.NetworkKit';
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+// Phase 2：OHAudioSuite 原生降噪引擎（native 模块）
+import nr from 'libentry_nr.so';
 
 const TAG: string = 'PhoneMic';
 const PORT_DEFAULT: number = 5000;
 const SAMPLE_RATE: number = 48000;   // 推流固定 48kHz（PC 接收端约定）
+const NR_RATE: number = 16000;       // 降噪引擎输出固定 16kHz，需重采样回 48kHz
 
 // ---------- 音源档位 ----------
 // 原声 = 手机可采集的最高音质（基准）；其余档位借系统场景算法做降噪，
@@ -45,12 +48,62 @@ const SOURCE_MODES: SourceMode[] = [
   },
 ];
 
+// ---------- 重采样器状态（两套：系统降采样还原、引擎降噪输出还原） ----------
+interface RsState {
+  queue: number[];   // 待消费的输入样本（int16）
+  pos: number;       // 分数相位位置
+}
+
+/**
+ * 把 buffer（inRate 单声道 S16LE）重采样回 48kHz 输出。
+ * 状态在 state 中跨缓冲连续；样本不足产不出输出时返回 null。
+ */
+function resampleChunk(buffer: ArrayBuffer, state: RsState, inRate: number): ArrayBuffer | null {
+  const dv: DataView = new DataView(buffer);
+  const n: number = Math.floor(dv.byteLength / 2);
+  for (let i = 0; i < n; i++) {
+    state.queue.push(dv.getInt16(i * 2, true));
+  }
+  // 每个输出样本消耗的输入样本数（<1 表示上采样）
+  const step: number = Math.max(0.01, inRate / SAMPLE_RATE);
+  const out: number[] = [];
+  while (state.pos + 1 < state.queue.length) {
+    const i: number = Math.floor(state.pos);
+    const frac: number = state.pos - i;
+    const a: number = state.queue[i];
+    const b: number = state.queue[i + 1];
+    let v: number = a + (b - a) * frac;
+    if (v > 32767) {
+      v = 32767;
+    } else if (v < -32768) {
+      v = -32768;
+    }
+    out.push(Math.round(v));
+    state.pos += step;
+  }
+  const drop: number = Math.floor(state.pos);
+  if (drop > 0) {
+    state.queue.splice(0, drop);
+    state.pos -= drop;
+  }
+  if (out.length === 0) {
+    return null;
+  }
+  const ab: ArrayBuffer = new ArrayBuffer(out.length * 2);
+  const ov: DataView = new DataView(ab);
+  for (let i = 0; i < out.length; i++) {
+    ov.setInt16(i * 2, out[i], true);
+  }
+  return ab;
+}
+
 @Entry
 @Component
 struct Index {
   @State serverIp: string = AppStorage.get<string>('pm_serverIp') ?? '192.168.1.100';
   @State serverPort: string = AppStorage.get<string>('pm_serverPort') ?? '5000';
   @State sourceKey: string = AppStorage.get<string>('pm_sourceKey') ?? 'mic';
+  @State nrEnabled: boolean = AppStorage.get<boolean>('pm_nrEnabled') ?? false;
   @State status: string = '未开始';
   @State streaming: boolean = false;
   @State level: number = 0;
@@ -67,8 +120,12 @@ struct Index {
   // 实际采样率与重采样状态（系统场景档位可能把采集降到 16kHz）
   private actualRate: number = SAMPLE_RATE;
   private rsEnabled: boolean = false;
-  private rsQueue: number[] = [];
-  private rsPos: number = 0;
+  private rsState: RsState = { queue: [], pos: 0 };
+
+  // 引擎降噪（Phase 2）：native 管线输出 16kHz，用第二套重采样状态拉回 48kHz
+  private nrActive: boolean = false;   // 本次推流中 nr.init() 是否成功
+  private nrRsState: RsState = { queue: [], pos: 0 };
+  private nrOutFrames: number = 0;
 
   build() {
     Scroll() {
@@ -134,6 +191,28 @@ struct Index {
           .fontSize(11)
           .fontColor('#999999')
           .width('100%')
+
+        // Phase 2：OHAudioSuite 原生降噪引擎开关
+        Row({ space: 10 }) {
+          Column({ space: 2 }) {
+            Text('引擎降噪（Phase 2 实验）')
+              .fontSize(14)
+              .fontColor('#333333')
+              .width('100%')
+            Text('系统级 AI 降噪算法，可叠加在任意音源档位上；引擎固定 16kHz 输出，APP 自动还原 48kHz 推流。与"系统3A"叠加官方不建议，仅作对比测试。')
+              .fontSize(11)
+              .fontColor('#999999')
+              .width('100%')
+          }
+          .layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.nrEnabled })
+            .id('nrToggle')
+            .onChange((on: boolean) => {
+              this.onNrToggle(on);
+            })
+        }
+        .width('100%')
+        .margin({ top: 10 })
 
         Button(this.streaming ? '停止推流' : '开始推流')
           .fontSize(18)
@@ -231,6 +310,76 @@ struct Index {
     }
   }
 
+  // ---------- 引擎降噪开关（Phase 2） ----------
+  private async onNrToggle(on: boolean): Promise<void> {
+    this.nrEnabled = on;
+    AppStorage.set('pm_nrEnabled', on);
+    if (!this.streaming) {
+      this.status = on ? '引擎降噪已开启（下次推流生效）' : '引擎降噪已关闭（下次推流生效）';
+      return;
+    }
+    // 推流中切换：重建 native 管线，约半秒间断
+    this.status = on ? '正在启动引擎降噪…' : '正在关闭引擎降噪…';
+    if (on) {
+      const rc: number = await this.nrInitForStream();
+      if (rc !== 0) {
+        this.nrEnabled = false;
+        AppStorage.set('pm_nrEnabled', false);
+        this.status = '引擎降噪启动失败(' + rc + ')，已关闭';
+      } else {
+        this.status = '引擎降噪已开启，推流中…';
+      }
+    } else {
+      this.nrStop();
+      this.status = '引擎降噪已关闭，推流中…';
+    }
+    this.refreshDspInfo();
+  }
+
+  /** 初始化 native 降噪管线；成功返回 0，失败返回负错误码并保持 nrActive=false。 */
+  private async nrInitForStream(): Promise<number> {
+    this.nrStop(); // 防御：清理可能残留的旧管线
+    const rc: number = nr.init();
+    if (rc !== 0) {
+      this.nrActive = false;
+      return rc;
+    }
+    this.nrActive = true;
+    this.nrRsState = { queue: [], pos: 0 };
+    this.nrOutFrames = 0;
+    // 预热：等引擎产出第一批数据（最多 800ms），避免推流头上一小段没声音
+    for (let i = 0; i < 16; i++) {
+      if (nr.pull().byteLength > 0) {
+        break;
+      }
+      // 预热期间没有音频回调数据可推——主动喂入一小段静音帮助引擎起转
+      this.nrWarmupFeed();
+      await this.nrSleep(50);
+    }
+    return 0;
+  }
+
+  private nrSleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve: () => void) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  /** 预热期间没有采集回调时，喂一小段静音帮助管线起转。 */
+  private nrWarmupFeed(): void {
+    // 调用方保证 nrActive；喂 20ms 静音（48kHz×2B）
+    const silence: ArrayBuffer = new ArrayBuffer(960);
+    nr.push(silence);
+  }
+
+  private nrStop(): void {
+    if (this.nrActive) {
+      nr.release();
+    }
+    this.nrActive = false;
+    this.nrRsState = { queue: [], pos: 0 };
+  }
+
   // ---------- 开始推流 ----------
   private async start(): Promise<void> {
     // 1. 申请麦克风权限
@@ -290,7 +439,21 @@ struct Index {
       this.bytesSent = 0;
       this.startedAt = Date.now();
       this.cbCount = 0;
-      this.status = '已连接，推流中…（音源：' + this.currentMode().label + '）';
+
+      // 5. 引擎降噪（Phase 2）：失败则自动回退纯推流，保证功能可用
+      if (this.nrEnabled) {
+        const rc: number = await this.nrInitForStream();
+        if (rc !== 0) {
+          this.nrEnabled = false;
+          AppStorage.set('pm_nrEnabled', false);
+          this.status = '引擎降噪启动失败(' + rc + ')，本次按普通推流';
+        }
+      }
+      this.refreshDspInfo();
+      if (this.status.indexOf('引擎降噪启动失败') < 0) {
+        this.status = '已连接，推流中…（音源：' + this.currentMode().label
+          + (this.nrActive ? ' ｜ 引擎降噪开' : '') + '）';
+      }
     } catch (e) {
       this.status = '连接失败: ' + this.errMsg(e) + '（检查 IP、端口和电脑防火墙）';
       this.cleanupSocket();
@@ -304,6 +467,7 @@ struct Index {
     this.connected = false;
     this.level = 0;
     await this.stopCapturerOnly();
+    this.nrStop();
     this.cleanupSocket();
     this.status = '已停止';
     this.stats = '';
@@ -346,6 +510,7 @@ struct Index {
     await this.capturer.start();
     this.detectActualRate();
     this.queryDenoiseState(mode.source);
+    this.refreshDspInfo();
   }
 
   /** 读取系统实际给的采样率：若低于 48kHz，启用重采样把推流拉回 48kHz。 */
@@ -388,8 +553,14 @@ struct Index {
   }
 
   private refreshDspInfo(): void {
-    this.dspInfo = '实际采集：' + this.actualRate + ' Hz'
+    let s: string = '实际采集：' + this.actualRate + ' Hz'
       + (this.rsEnabled ? '（已重采样回 48000 推流）' : '');
+    if (this.nrActive) {
+      s += ' ｜ 引擎降噪：开（输出 16k 已还原 48k）';
+    } else if (this.nrEnabled) {
+      s += ' ｜ 引擎降噪：启动失败';
+    }
+    this.dspInfo = s;
   }
 
   private async stopCapturerOnly(): Promise<void> {
@@ -422,13 +593,31 @@ struct Index {
     if (tcp === null) {
       return;
     }
+    // 第一级：系统若把采集降到 16kHz，先重采样回 48kHz
     let payload: ArrayBuffer = buffer;
     if (this.rsEnabled) {
-      const out: ArrayBuffer | null = this.resampleBuffer(buffer);
-      if (out === null) {
-        return;   // 排队中的样本还不够产出一个输出帧，等下一个缓冲
+      const up: ArrayBuffer | null = resampleChunk(payload, this.rsState, this.actualRate);
+      if (up === null) {
+        return; // 排队中的样本还不够产出一个输出帧，等下一个缓冲
       }
-      payload = out;
+      payload = up;
+    }
+    // 第二级：引擎降噪——送 native 管线，拉回 16kHz 结果再重采样回 48kHz
+    if (this.nrActive) {
+      const backlog: number = nr.push(payload);
+      if (backlog > 300 && this.cbCount % 20 === 0) {
+        this.status = '引擎降噪处理积压 ' + backlog + ' ms（实时性可能下降）';
+      }
+      const out: ArrayBuffer = nr.pull();
+      if (out.byteLength === 0) {
+        return; // 管线预热/欠载，本帧不发送
+      }
+      const up: ArrayBuffer | null = resampleChunk(out, this.nrRsState, NR_RATE);
+      if (up === null) {
+        return;
+      }
+      this.nrOutFrames += up.byteLength;
+      payload = up;
     }
     try {
       tcp.send({ data: payload }).catch((err: BusinessError) => {
@@ -445,49 +634,9 @@ struct Index {
     }
   };
 
-  // ---------- 重采样（线性插值，语音够用；把 actualRate 拉回 48kHz） ----------
+  // ---------- 重采样（线性插值，语音够用；把任意 inRate 拉回 48kHz） ----------
   private rsReset(): void {
-    this.rsQueue = [];
-    this.rsPos = 0;
-  }
-
-  private resampleBuffer(buffer: ArrayBuffer): ArrayBuffer | null {
-    const dv: DataView = new DataView(buffer);
-    const n: number = Math.floor(dv.byteLength / 2);
-    for (let i = 0; i < n; i++) {
-      this.rsQueue.push(dv.getInt16(i * 2, true));
-    }
-    // 每个输出样本消耗的输入样本数（<1 表示上采样）
-    const step: number = Math.max(0.01, this.actualRate / SAMPLE_RATE);
-    const out: number[] = [];
-    while (this.rsPos + 1 < this.rsQueue.length) {
-      const i: number = Math.floor(this.rsPos);
-      const frac: number = this.rsPos - i;
-      const a: number = this.rsQueue[i];
-      const b: number = this.rsQueue[i + 1];
-      let v: number = a + (b - a) * frac;
-      if (v > 32767) {
-        v = 32767;
-      } else if (v < -32768) {
-        v = -32768;
-      }
-      out.push(Math.round(v));
-      this.rsPos += step;
-    }
-    const drop: number = Math.floor(this.rsPos);
-    if (drop > 0) {
-      this.rsQueue.splice(0, drop);
-      this.rsPos -= drop;
-    }
-    if (out.length === 0) {
-      return null;
-    }
-    const ab: ArrayBuffer = new ArrayBuffer(out.length * 2);
-    const ov: DataView = new DataView(ab);
-    for (let i = 0; i < out.length; i++) {
-      ov.setInt16(i * 2, out[i], true);
-    }
-    return ab;
+    this.rsState = { queue: [], pos: 0 };
   }
 
   // ---------- 工具 ----------
