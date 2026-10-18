@@ -59,6 +59,10 @@ interface RsState {
  * 状态在 state 中跨缓冲连续；样本不足产不出输出时返回 null。
  */
 function resampleChunk(buffer: ArrayBuffer, state: RsState, inRate: number): ArrayBuffer | null {
+  // 防御：native/上游传来坏对象时直接丢弃本帧，绝不让 DataView 构造炸掉
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 2) {
+    return null;
+  }
   const dv: DataView = new DataView(buffer);
   const n: number = Math.floor(dv.byteLength / 2);
   for (let i = 0; i < n; i++) {
@@ -349,7 +353,8 @@ struct Index {
     this.nrOutFrames = 0;
     // 预热：等引擎产出第一批数据（最多 800ms），避免推流头上一小段没声音
     for (let i = 0; i < 16; i++) {
-      if (nr.pull().byteLength > 0) {
+      const warm: ArrayBuffer = nr.pull();
+      if (warm instanceof ArrayBuffer && warm.byteLength > 0) {
         break;
       }
       // 预热期间没有音频回调数据可推——主动喂入一小段静音帮助引擎起转
@@ -589,6 +594,9 @@ struct Index {
     if (!this.connected) {
       return;
     }
+    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength === 0) {
+      return;
+    }
     const tcp: socket.TCPSocket | null = this.tcp;
     if (tcp === null) {
       return;
@@ -609,7 +617,8 @@ struct Index {
         this.status = '引擎降噪处理积压 ' + backlog + ' ms（实时性可能下降）';
       }
       const out: ArrayBuffer = nr.pull();
-      if (out.byteLength === 0) {
+      // 三重防御：坏对象 / 空缓冲都直接丢帧——DataView 构造对未初始化句柄会 SIGSEGV
+      if (!(out instanceof ArrayBuffer) || out.byteLength === 0) {
         return; // 管线预热/欠载，本帧不发送
       }
       const up: ArrayBuffer | null = resampleChunk(out, this.nrRsState, NR_RATE);

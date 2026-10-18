@@ -3,9 +3,12 @@
  */
 #include <napi/native_api.h>
 
-#include "nr_pipeline.h"
-
+#include <cstring>
 #include <vector>
+
+#include <hilog/log.h>
+
+#include "nr_pipeline.h"
 
 namespace {
 constexpr size_t kPullChunkBytes = 2048; // 每次 pull 最大字节（16k×2B≈64ms）
@@ -45,7 +48,18 @@ static napi_value NrPush(napi_env env, napi_callback_info info)
     void* data = nullptr;
     size_t len = 0;
     napi_get_arraybuffer_info(env, argv[0], &data, &len);
-    int backlog = NoiseReductionPipeline::Get().Push(static_cast<uint8_t*>(data), len);
+    if (data == nullptr || len == 0) {
+        napi_value r;
+        napi_create_int32(env, -3, &r);
+        return r;
+    }
+    auto& pl = NoiseReductionPipeline::Get();
+    if (!pl.IsRunning()) {
+        napi_value r;
+        napi_create_int32(env, -4, &r);
+        return r;
+    }
+    int backlog = pl.Push(static_cast<uint8_t*>(data), len);
     napi_value r;
     napi_create_int32(env, backlog, &r);
     return r;
@@ -57,13 +71,30 @@ static napi_value NrPull(napi_env env, napi_callback_info info)
     // 尽量取空队列（最多 kPullChunkBytes 一次）
     static thread_local std::vector<uint8_t> tmp;
     tmp.resize(kPullChunkBytes);
-    size_t got = pl.Pull(tmp.data(), tmp.size());
-    napi_value ab;
-    napi_create_arraybuffer(env, got, nullptr, &ab);
+    size_t got = 0;
+    if (pl.IsRunning()) {
+        got = pl.Pull(tmp.data(), tmp.size());
+    }
+    napi_value ab = nullptr;
+    napi_status st = napi_create_arraybuffer(env, got, nullptr, &ab);
+    if (st != napi_ok || ab == nullptr) {
+        // 兜底：创建失败时也必须返回一个合法的空 ArrayBuffer，
+        // 否则 ArkTS 侧拿到未初始化句柄会直接 SIGSEGV
+        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "PhoneMicNr",
+            "napi_create_arraybuffer failed st=%{public}d got=%{public}zu", (int)st, got);
+        ab = nullptr;
+        napi_create_arraybuffer(env, 0, nullptr, &ab);
+        return ab;
+    }
     if (got > 0) {
         void* dst = nullptr;
         napi_get_arraybuffer_info(env, ab, &dst, nullptr);
-        std::memcpy(dst, tmp.data(), got);
+        if (dst == nullptr) {
+            OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "PhoneMicNr",
+                "arraybuffer data is null, got=%{public}zu", got);
+        } else {
+            std::memcpy(dst, tmp.data(), got);
+        }
     }
     return ab;
 }

@@ -12,7 +12,6 @@
 
 namespace {
 constexpr int32_t kRenderRequestBytes = 2048; // 每次 RenderFrame 请求字节（16k×2B≈64ms）
-constexpr int kCallbackWaitMs = 50;           // RequestDataCallback 最长等待
 } // namespace
 
 // ---------- C 回调（引擎在渲染线程里同步调用） ----------
@@ -48,6 +47,7 @@ int NoiseReductionPipeline::Init()
         NR_LOGE("noise reduction node not supported");
         return NR_ERR_NODE_UNSUPPORTED;
     }
+    NR_LOGD("step1: node type supported");
 
     // 2. 引擎
     if (OH_AudioSuiteEngine_Create(&engine_) != AUDIOSUITE_SUCCESS || engine_ == nullptr) {
@@ -55,6 +55,7 @@ int NoiseReductionPipeline::Init()
         Teardown();
         return NR_ERR_ENGINE_CREATE;
     }
+    NR_LOGD("step2: engine created");
 
     // 3. 管线（实时模式；API 23+ 支持全部效果节点）
     if (OH_AudioSuiteEngine_CreatePipeline(engine_, &pipeline_, AUDIOSUITE_PIPELINE_REALTIME_MODE)
@@ -100,6 +101,8 @@ int NoiseReductionPipeline::Init()
         return NR_ERR_NODE_CREATE;
     }
 
+    NR_LOGD("step5: nr node created");
+
     // 6. 输出节点：16kHz / 单声道 / S16LE（降噪节点输出固定格式）
     OH_AudioFormat outFmt{};
     outFmt.samplingRate = SAMPLE_RATE_16000;
@@ -117,6 +120,7 @@ int NoiseReductionPipeline::Init()
         return NR_ERR_NODE_CREATE;
     }
     OH_AudioSuiteNodeBuilder_Destroy(builder);
+    NR_LOGD("step6: output node created");
 
     // 7. 连接：输入 → 降噪 → 输出
     if (OH_AudioSuiteEngine_ConnectNodes(inputNode_, nrNode_) != AUDIOSUITE_SUCCESS
@@ -125,6 +129,7 @@ int NoiseReductionPipeline::Init()
         Teardown();
         return NR_ERR_CONNECT;
     }
+    NR_LOGD("step7: nodes connected");
 
     // 8. 启动
     if (OH_AudioSuiteEngine_StartPipeline(pipeline_) != AUDIOSUITE_SUCCESS) {
@@ -132,6 +137,7 @@ int NoiseReductionPipeline::Init()
         Teardown();
         return NR_ERR_START;
     }
+    NR_LOGD("step8: pipeline started");
 
     inRing_.clear();
     outRing_.clear();
@@ -151,16 +157,16 @@ int NoiseReductionPipeline::Init()
 
 int32_t NoiseReductionPipeline::OnRequestData(void* audioData, int32_t audioDataSize, bool* finished)
 {
-    // 等到有足够数据 / 停止 / 超时
-    std::unique_lock<std::mutex> lk(cvMutex_);
-    dataCv_.wait_for(lk, std::chrono::milliseconds(kCallbackWaitMs), [this] {
-        return stopping_.load() || inRing_.available() >= static_cast<size_t>(2048);
-    });
+    // 绝不阻塞：引擎可能在持有内部状态时调用本回调，阻塞等待有死锁/看门狗风险。
+    // 没有足够数据就返回 0（头文件允许 0~audioDataSize），由 RenderFrame 循环空转退让。
     if (stopping_.load()) {
         *finished = true;
         return 0;
     }
-    lk.unlock();
+    size_t avail = inRing_.available();
+    if (avail == 0) {
+        return 0;
+    }
     return static_cast<int32_t>(inRing_.read(static_cast<uint8_t*>(audioData),
         static_cast<size_t>(audioDataSize)));
 }
